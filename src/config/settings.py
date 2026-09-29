@@ -32,9 +32,9 @@ class Settings:
     
     # LLM Configuration
     
-    LLM_MODEL = "qwen2.5:8b"
+    LLM_MODEL = "qwen3:8b"
     
-    TEMPERATURE = 0.2
+    TEMPERATURE = 0.0
     
     LOG_LEVEL = "INFO"
     

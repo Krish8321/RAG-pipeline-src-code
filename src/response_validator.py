@@ -41,20 +41,42 @@ KNOWN_TECHNIQUES: dict[str, str] = {
 TECHNIQUE_ID_PATTERN = re.compile(r"\bT\d{4}(?:\.\d{3})?\b")
 
 # Tokens that look like specific technical artifacts (filenames,
-# CLI flags, etc). Deliberately broad -- false positives here just
-# mean an extra warning line, which is a cheap cost compared to an
-# unflagged fabrication reaching an analyst.
+# CLI flags, IPs, Windows log-field fabrications).
 ARTIFACT_PATTERN = re.compile(
     r"""
-    \b[\w\-]+\.(exe|dll|ps1|bat|sh|py)\b   # filenames
-    | (?<!\w)-{1,2}[a-zA-Z][\w-]*          # CLI flags like -u, --password
-    | \b\d{1,3}(?:\.\d{1,3}){3}\b          # IPv4-looking strings
+    \b[\w\-]+\.(exe|dll|ps1|bat|sh|py)\b           # filenames
+    | (?<!\w)-{1,2}[a-zA-Z][\w-]*                  # CLI flags like -u, --password
+    | \b\d{1,3}(?:\.\d{1,3}){3}\b                  # IPv4 addresses
+    | \b(?:EventID|ShareName|SubjectUserName|TargetUserName|WorkstationName|LogonType|LogonGuid|ProcessName|ParentProcessName|CommandLine|ServiceName|RelativeTargetName|AccessMask|ObjectType|IpAddress|IpPort)\b(?:\s*[:=]\s*[\w\-\.\$\\]+)?  # Windows log / Sigma field tokens
     """,
     re.IGNORECASE | re.VERBOSE,
 )
 
-SECTION_PATTERN = re.compile(
-    r"^(Observed Evidence|IOCs):\s*$", re.IGNORECASE | re.MULTILINE
+THREAT_ACTOR_MALWARE_PATTERN = re.compile(
+    r"""
+    \b(?:
+        APT\d+
+        | Cobalt\s+Strike
+        | Mimikatz
+        | Emotet
+        | LockBit
+        | Qakbot|Qbot
+        | TrickBot
+        | Ryuk
+        | BlackCat
+        | Wizard\s+Spider
+        | Cozy\s+Bear
+        | Fancy\s+Bear
+        | Lazarus\s+Group
+        | [A-Z][a-z]+\s+(?:Spider|Bear|Panda|Kitten|Tiger|Dragon|Viper|Chollima|APT\d*|Group)
+    )\b
+    """,
+    re.VERBOSE,
+)
+
+SECTION_HEADER_PATTERN = re.compile(
+    r"^(?:\#+\s*)?(Observed Evidence|IOCs|IOCs Extracted|AI Reasoning|RAG Threat Intel Context|Escalation Recommendation|Risk Score|Risk Assessment|Threat Assessment|MITRE ATT&CK Techniques|Recommended Response|Investigation Steps):",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -70,34 +92,22 @@ class ValidationResult:
 class ResponseValidator:
     """
     Post-generation safety net for the final SOC triage response.
-
-    Does NOT rewrite or "fix" the response -- an automated fix could
-    itself introduce errors. It only flags likely hallucinations so
-    a human reviewer knows to double-check specific lines before
-    trusting them. This exists because prompt instructions alone
-    have repeatedly failed to prevent these exact failure modes with
-    an 8B local model; a deterministic check doesn't depend on the
-    model choosing to comply.
-
-    Does NOT
-    --------
-    - Modify the response text.
-    - Call the LLM again.
-    - Replace careful prompt design -- this catches what slips
-      through, it doesn't replace fixing the prompt.
     """
 
     def validate(
         self,
         response: str,
         alert_text: str,
-        context: list[dict[str, Any]],
+        context: list[dict[str, Any]] | dict[str, Any],
     ) -> ValidationResult:
         result = ValidationResult()
 
         self._check_ungrounded_artifacts(response, alert_text, result)
-        self._check_mitre_pairs(response, result)
+        self._check_mitre_pairs(response, context, result)
+        self._check_threat_actors_and_malware(response, alert_text, context, result)
         self._check_fabricated_severity(response, alert_text, result)
+        self._check_playbook_tracing(response, context, result)
+        self._check_risk_score_format(response, result)
 
         if result.has_warnings:
             logger.warning("=" * 60)
@@ -118,27 +128,25 @@ class ResponseValidator:
         result: ValidationResult,
     ) -> None:
         """
-        Flag technical-looking tokens (filenames, CLI flags, IPs)
-        that appear in the Observed Evidence / IOCs sections but not
+        Flag technical-looking tokens (filenames, CLI flags, IPs, log fields)
+        that appear in the evidence/reasoning/IOC sections but not
         in the alert text itself.
         """
 
         alert_lower = alert_text.lower()
+        matches = list(SECTION_HEADER_PATTERN.finditer(response))
 
-        for section_match in SECTION_PATTERN.finditer(response):
-            section_name = section_match.group(1)
-            start = section_match.end()
-            # Section runs until the next blank-line-separated header
-            # or end of string. Simple heuristic: up to next line
-            # starting with a capitalized word followed by ":".
-            end_match = re.search(
-                r"\n[A-Z][\w /]+:\s*\n", response[start:]
-            )
-            end = start + end_match.start() if end_match else len(response)
+        for i, match in enumerate(matches):
+            section_name = match.group(1)
+            start = match.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(response)
             section_text = response[start:end]
 
-            for match in ARTIFACT_PATTERN.finditer(section_text):
-                token = match.group(0)
+            if not any(kw in section_name.lower() for kw in ("observed evidence", "iocs", "iocs extracted", "ai reasoning", "rag threat intel")):
+                continue
+
+            for art_match in ARTIFACT_PATTERN.finditer(section_text):
+                token = art_match.group(0)
                 if token.lower() not in alert_lower:
                     result.warnings.append(
                         f"[{section_name}] Contains '{token}', which "
@@ -149,35 +157,84 @@ class ResponseValidator:
     def _check_mitre_pairs(
         self,
         response: str,
+        context: list[dict[str, Any]] | dict[str, Any],
         result: ValidationResult,
     ) -> None:
         """
-        Flag technique IDs whose paired name doesn't match the known
-        canonical name, or IDs not recognized at all.
+        Flag technique IDs whose ID doesn't appear anywhere in the
+        retrieved documents' text/metadata for this specific run, or whose
+        canonical name does not appear near the cited ID in the response.
         """
+
+        context_parts = []
+        if isinstance(context, dict):
+            context_docs = context.get("documents", [])
+        else:
+            context_docs = context
+
+        for doc in context_docs:
+            if isinstance(doc, dict):
+                for v in doc.values():
+                    if isinstance(v, (str, int, float)):
+                        context_parts.append(str(v))
+            else:
+                context_parts.append(str(doc))
+        full_context_str = "\n".join(context_parts).lower()
 
         for match in TECHNIQUE_ID_PATTERN.finditer(response):
             technique_id = match.group(0)
+            tech_id_lower = technique_id.lower()
 
-            # Look at a short window after the ID for "– Name" or "- Name"
-            window = response[match.end():match.end() + 80]
-            name_match = re.match(r"\s*[–—-]\s*([^\n(]+)", window)
-            claimed_name = name_match.group(1).strip() if name_match else None
-
-            canonical_name = KNOWN_TECHNIQUES.get(technique_id)
-
-            if canonical_name is None:
+            # Strict rule 1: any cited technique ID MUST appear in the retrieved context (case-insensitive)
+            if tech_id_lower not in full_context_str:
                 result.warnings.append(
-                    f"MITRE technique '{technique_id}' is not in the "
-                    f"known-technique list — verify this ID actually "
-                    f"appears in the retrieved evidence, not from "
-                    f"model memory."
+                    f"MITRE technique '{technique_id}' was cited in the response "
+                    f"but does not appear anywhere in the retrieved context for this run."
                 )
-            elif claimed_name and canonical_name.lower() not in claimed_name.lower():
+                continue
+
+            # Strict rule 2: if canonical name is known, check if it appears in the response
+            canonical_name = KNOWN_TECHNIQUES.get(technique_id)
+            if canonical_name:
+                if canonical_name.lower() not in response.lower():
+                    result.warnings.append(
+                        f"MITRE technique '{technique_id}' is known as '{canonical_name}', "
+                        f"but that name was not found anywhere in the response."
+                    )
+
+    def _check_threat_actors_and_malware(
+        self,
+        response: str,
+        alert_text: str,
+        context: list[dict[str, Any]] | dict[str, Any],
+        result: ValidationResult,
+    ) -> None:
+        """
+        Flag named threat actors or malware tools cited in the response if they do not
+        appear anywhere in the alert text or retrieved context for this run.
+        """
+
+        context_parts = [alert_text]
+        if isinstance(context, dict):
+            context_docs = context.get("documents", [])
+        else:
+            context_docs = context
+
+        for doc in context_docs:
+            if isinstance(doc, dict):
+                for v in doc.values():
+                    if isinstance(v, (str, int, float)):
+                        context_parts.append(str(v))
+            else:
+                context_parts.append(str(doc))
+        full_context_str = "\n".join(context_parts).lower()
+
+        for match in THREAT_ACTOR_MALWARE_PATTERN.finditer(response):
+            entity = match.group(0)
+            if entity.lower() not in full_context_str:
                 result.warnings.append(
-                    f"MITRE technique '{technique_id}' was paired with "
-                    f"'{claimed_name}', but the known name is "
-                    f"'{canonical_name}' — likely a mismatched ID/name pair."
+                    f"Threat actor / malware '{entity}' was cited in the response "
+                    f"but does not appear anywhere in the alert text or retrieved context for this run."
                 )
 
     def _check_fabricated_severity(
@@ -187,26 +244,111 @@ class ResponseValidator:
         result: ValidationResult,
     ) -> None:
         """
-        Flag claims that the alert has an explicit severity when the
-        alert text contains no such indicator.
+        Flag affirmative claims that the alert has an explicit severity when the
+        alert text contains no such indicator. Does NOT match template-compliant
+        disclaimers like "No alert severity was provided".
         """
 
-        severity_claim = re.search(
-            r"(alert'?s?\s+severity|severity\s+(?:level\s+)?is\s+(?:explicitly\s+)?"
-            r"(?:marked|labeled|stated))",
-            response,
+        has_severity_in_alert = bool(
+            re.search(
+                r"\bsever(?:e|ity)\b|\b(low|medium|high|critical)\s+severity\b",
+                alert_text,
+                re.IGNORECASE,
+            )
+        )
+
+        if has_severity_in_alert:
+            return
+
+        # Match severity claim phrases
+        claim_pattern = re.compile(
+            r"(?:alert'?s?\s+severity|severity\s+(?:level\s+)?is\s+(?:explicitly\s+)?(?:marked|labeled|stated|provided))",
             re.IGNORECASE,
         )
 
-        has_severity_word = re.search(
-            r"\bsever(?:e|ity)\b|\b(low|medium|high|critical)\s+severity\b",
-            alert_text,
-            re.IGNORECASE,
-        )
+        for match in claim_pattern.finditer(response):
+            # Check prefix window before match for negation terms
+            start = max(0, match.start() - 30)
+            prefix = response[start:match.start()].lower()
 
-        if severity_claim and not has_severity_word:
+            # Ignore compliant negated phrasing (e.g. "No alert severity was provided", "without explicit severity")
+            if any(negation in prefix for negation in ("no ", "no\n", "not ", "without ")):
+                continue
+
             result.warnings.append(
                 "Response claims the alert has an explicit severity "
                 "level, but no severity indicator was found in the "
                 "alert text or metadata. Likely fabricated."
+            )
+            break
+
+    def _check_playbook_tracing(
+        self,
+        response: str,
+        context: list[dict[str, Any]] | dict[str, Any],
+        result: ValidationResult,
+    ) -> None:
+        """
+        Flag when IR_PLAYBOOKS documents were provided in context, but the response
+        contains recommendations that do not trace back to any retrieved playbook.
+        """
+        context_docs = context.get("documents", []) if isinstance(context, dict) else context
+
+        playbook_docs = [
+            doc for doc in context_docs
+            if isinstance(doc, dict) and doc.get("source") == "IR_PLAYBOOKS"
+        ]
+
+        if not playbook_docs:
+            return
+
+        playbook_text = "\n".join(
+            str(doc.get("document", "")) for doc in playbook_docs
+        ).lower()
+
+        matches = list(SECTION_HEADER_PATTERN.finditer(response))
+        rec_section_text = ""
+        for i, match in enumerate(matches):
+            section_name = match.group(1).lower()
+            if any(k in section_name for k in ("recommended response", "escalation recommendation", "investigation steps")):
+                start = match.end()
+                end = matches[i + 1].start() if i + 1 < len(matches) else len(response)
+                rec_section_text += response[start:end] + "\n"
+
+        if not rec_section_text.strip():
+            return
+
+        action_keywords = [
+            word for word in re.findall(r"\b[a-z]{4,}\b", rec_section_text.lower())
+            if word not in ("with", "from", "that", "this", "have", "been", "were", "should", "would", "could", "recommendation", "escalation", "response", "immediately")
+        ]
+
+        overlap = any(kw in playbook_text for kw in action_keywords)
+
+        if not overlap and action_keywords:
+            result.warnings.append(
+                "Response recommendation guidance was generated when IR_PLAYBOOKS documents were available in context, "
+                "but recommendation details do not trace back to any retrieved playbook document."
+            )
+
+    def _check_risk_score_format(
+        self,
+        response: str,
+        result: ValidationResult,
+    ) -> None:
+        """
+        Validate that a numeric Risk Score (0-100) is present and formatted cleanly.
+        Flexibly accepts N/100, N%, or integer N between 0 and 100.
+        """
+        score_match = re.search(r"Risk\s+Score:\s*(\d{1,3})(?:\s*/\s*100|\s*%)?", response, re.IGNORECASE)
+        if not score_match:
+            result.warnings.append(
+                "Risk Score section is missing or does not contain a valid numeric score (0-100)."
+            )
+            return
+
+        score_val = int(score_match.group(1))
+        if not (0 <= score_val <= 100):
+            result.warnings.append(
+                f"Risk Score value '{score_val}' is out of range (must be 0-100)."
             )

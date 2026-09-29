@@ -1,9 +1,11 @@
-from __future__ import annotations
+import os
+import sys
+from dotenv import load_dotenv
 
 from src.config.logging_config import setup_logger
 
 from src.embeddings.embedder import DocumentEmbedder
-from src.llm.ollama_client import OllamaClient
+from src.llm import OllamaClient, GeminiClient
 
 from src.retrieval.query_generator import QueryGenerator
 from src.retrieval.retrieval_planner import RetrievalPlanner
@@ -20,33 +22,12 @@ from src.response_validator import ResponseValidator
 
 
 logger = setup_logger()
+load_dotenv()
 
 
 def main() -> None:
     """
     Run the complete ARIA RAG pipeline.
-
-    Pipeline
-    --------
-    User Query
-        ↓
-    Retrieval Planner
-        ↓
-    Query Generator
-        ↓
-    Multi-Query Retriever
-        ↓
-    Deduplicator
-        ↓
-    Single-Query Reranker
-        ↓
-    Context Builder
-        ↓
-    Prompt Builder
-        ↓
-    Ollama LLM
-        ↓
-    Final SOC Response
     """
 
     # ============================================================
@@ -54,23 +35,36 @@ def main() -> None:
     # ============================================================
 
     user_query = (
-        "PsExec execution detected from a workstation to a domain controller using ADMIN$ share and remote service execution"
+        "Suspicious PowerShell encoded payload A-003 · 14:27:14 · WS-ACCT-021"
     )
+    
+    # user_query = (
+    #     "Failed MFA push: 12 notifications in 3 mins A-005 · 14:18:47 · user: j.chen@corp.com"
+    # )
+    
+    # user_query = (
+    #     "Data exfiltration: 4.2 GB upload to Mega.nz A-004 · 14:25:33 · 192.168.5.103"
+    # )
 
     # ============================================================
     # 2. INITIALIZE COMPONENTS
     # ============================================================
-
+    
     planner = RetrievalPlanner(
         top_k_per_source=5
     )
 
-    ollama_client = OllamaClient(
-        model="qwen3:8b"
-    )
+    llm_backend = os.getenv("LLM_BACKEND", os.getenv("LLM_PROVIDER", "ollama")).lower().strip()
+
+    if llm_backend == "gemini":
+        model_name = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite-preview")
+        llm_client = GeminiClient(model=model_name)
+    else:
+        model_name = os.getenv("OLLAMA_MODEL", "qwen3:8b")
+        llm_client = OllamaClient(model=model_name)
 
     query_generator = QueryGenerator(
-        llm_client=ollama_client
+        llm_client=llm_client
     )
 
     embedder = DocumentEmbedder()
@@ -164,7 +158,7 @@ def main() -> None:
     # 10. GENERATE FINAL SOC RESPONSE
     # ============================================================
 
-    response = ollama_client.generate(
+    response = llm_client.generate(
         prompt
     )
     
@@ -200,14 +194,26 @@ def main() -> None:
         logger.info("=" * 60)
 
     # ============================================================
-    # 11. DISPLAY ONLY LLM RESPONSE
+    # 11. DISPLAY RENDERED EVIDENCE SECTION & FINAL LLM RESPONSE
     # ============================================================
+
+    print("\n" + "=" * 80)
+    print("RENDERED PROMPT EVIDENCE SECTION:")
+    print("=" * 80)
+
+    # Extract and display the RETRIEVED SECURITY KNOWLEDGE block from rendered prompt
+    if "RETRIEVED SECURITY KNOWLEDGE:" in prompt:
+        evidence_block = prompt.split("RETRIEVED SECURITY KNOWLEDGE:")[1].split("============================================================")[0].strip()
+        print("RETRIEVED SECURITY KNOWLEDGE:")
+        print(evidence_block.encode(sys.stdout.encoding or 'utf-8', errors='replace').decode(sys.stdout.encoding or 'utf-8'))
+    else: 
+        print(prompt.encode(sys.stdout.encoding or 'utf-8', errors='replace').decode(sys.stdout.encoding or 'utf-8'))
 
     print("\n" + "=" * 80)
     print("Final ARIA Response : ")
     print("=" * 80)
 
-    print(response)
+    print(response.encode(sys.stdout.encoding or 'utf-8', errors='replace').decode(sys.stdout.encoding or 'utf-8'))
 
 
 if __name__ == "__main__":

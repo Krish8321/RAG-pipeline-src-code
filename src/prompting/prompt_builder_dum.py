@@ -53,7 +53,7 @@ class PromptBuilder:
 
     def __init__(
         self,
-        template_name: str = "final_prompt.j2",
+        template_name: str = "aria_triage_prompt_v2.j2",
     ) -> None:
 
         project_root = Path(
@@ -172,8 +172,9 @@ class PromptBuilder:
     def build(
         self,
         alert_text: str,
-        context: list[dict[str, Any]],
+        context: list[dict[str, Any]] | dict[str, Any],
         alert_metadata: dict[str, Any] | None = None,
+        technique_consensus: str | None = None,
     ) -> str:
         """
         Build the final ARIA LLM prompt.
@@ -185,17 +186,15 @@ class PromptBuilder:
             `alert_text` variable.
 
         context
-            Structured evidence produced by ContextBuilder. Each item
-            must contain: rank, source, type, name, rerank_score,
-            document. `matched_behavior` and `relevance_tier` are
-            optional and rendered only if present. Rendered into the
-            template's `retrieved_documents` variable.
+            Structured evidence produced by ContextBuilder (dict or list).
+            Rendered into the template's `retrieved_documents` and
+            `technique_consensus` variables.
 
         alert_metadata
-            Optional dict of alert-level metadata (e.g. source,
-            timestamp, severity). Rendered into the template's
-            `alert_metadata` variable; omitted from the prompt
-            entirely if None or empty.
+            Optional dict of alert-level metadata.
+
+        technique_consensus
+            Optional MITRE technique consensus string.
 
         Returns
         -------
@@ -223,9 +222,20 @@ class PromptBuilder:
                 "Context cannot be None."
             )
 
-        if not isinstance(context, list):
+        computed_risk_score = 50
+        risk_factors = []
+        escalation_recommendation = "Escalate to Tier-2 Analyst Review"
+        if isinstance(context, dict):
+            documents = context.get("documents", [])
+            technique_consensus = context.get("technique_consensus", technique_consensus)
+            computed_risk_score = context.get("computed_risk_score", 50)
+            risk_factors = context.get("risk_factors", [])
+            escalation_recommendation = context.get("escalation_recommendation", "Escalate to Tier-2 / Analyst Investigation Required")
+        elif isinstance(context, list):
+            documents = context
+        else:
             raise TypeError(
-                "Context must be a list."
+                "Context must be a list or dict."
             )
 
         if alert_metadata is not None and not isinstance(
@@ -235,8 +245,8 @@ class PromptBuilder:
                 "alert_metadata must be a dict or None."
             )
 
-        self._validate_documents(context)
-        normalized_context = self._normalize_documents(context)
+        self._validate_documents(documents)
+        normalized_context = self._normalize_documents(documents)
 
         logger.info("=" * 60)
         logger.info("BUILDING TRIAGE PROMPT")
@@ -252,13 +262,29 @@ class PromptBuilder:
 
         logger.info(
             f"Context Documents : "
-            f"{len(context)}"
+            f"{len(documents)}"
+        )
+
+        if technique_consensus:
+            logger.info(
+                f"Technique Consensus : {technique_consensus}"
+            )
+
+        logger.info(
+            f"Computed Risk Score : {computed_risk_score}/100"
+        )
+        logger.info(
+            f"Escalation Recommendation : {escalation_recommendation}"
         )
 
         prompt = self.template.render(
             alert_text=alert_text,
             alert_metadata=alert_metadata,
             retrieved_documents=normalized_context,
+            technique_consensus=technique_consensus,
+            computed_risk_score=computed_risk_score,
+            risk_factors=risk_factors,
+            escalation_recommendation=escalation_recommendation,
         )
 
         logger.info(
