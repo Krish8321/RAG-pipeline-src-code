@@ -69,6 +69,8 @@ class DocumentReranker:
         queries: list[str],
         documents: list[RetrievedDocument],
         top_k: int = 10,
+        min_playbook_slots: int = 1,
+        playbook_relevance_floor: float = 0.010,
     ) -> list[RetrievedDocument]:
         """
         Re-rank retrieved documents according to
@@ -175,7 +177,8 @@ class DocumentReranker:
             tokenized = tokenizer(
                 text,
                 add_special_tokens=True,
-                truncation=False,
+                truncation=True,
+                max_length=512,
             )
 
             token_count = len(
@@ -189,46 +192,58 @@ class DocumentReranker:
             )
 
         # ---------------------------------------------------------
-        # CREATE QUERY-DOCUMENT PAIRS
+        # CREATE QUERY-DOCUMENT PAIRS WITH DYNAMIC SLIDING-WINDOW CHUNKING
         # ---------------------------------------------------------
 
-        pairs = []
+        model_max_len = getattr(self.model, "max_seq_length", 512) or 512
+        special_tokens = 4  # [CLS], [SEP], [SEP] + 1 token safety margin
 
-        pair_metadata = []
+        pairs: list[list[str]] = []
+        pair_metadata: list[tuple[int, int]] = []
+        max_pair_tokens_observed = 0
+        max_query_tokens_observed = 0
 
-        for query_index, query in enumerate(
-            queries
-        ):
+        for query_index, query in enumerate(queries):
+            query_tokens = len(self.model.tokenizer.encode(query, add_special_tokens=False, truncation=True, max_length=model_max_len))
+            max_query_tokens_observed = max(max_query_tokens_observed, query_tokens)
 
-            for document_index, document in enumerate(
-                documents
-            ):
+            for document_index, document in enumerate(documents):
+                name = document.metadata.get("name", "")
+                prefix_header = f"Document Name: {name}\n"
+                header_tokens = len(self.model.tokenizer.encode(prefix_header, add_special_tokens=False, truncation=True, max_length=model_max_len))
 
-                name = document.metadata.get(
-                    "name",
-                    "",
-                )
+                max_doc_tokens = max(50, model_max_len - query_tokens - header_tokens - special_tokens)
+                overlap = min(50, max_doc_tokens // 4)
+                step = max(10, max_doc_tokens - overlap)
 
-                rerank_text = (
-                    f"Document Name: {name}\n"
-                    f"{document.document}"
-                )
+                doc_text = document.document
+                doc_tokens = self.model.tokenizer.encode(doc_text, add_special_tokens=False, truncation=True, max_length=4096)
 
-                pairs.append(
-                    [query, rerank_text]
-                )
+                if len(doc_tokens) <= max_doc_tokens:
+                    full_text = f"{prefix_header}{doc_text}"
+                    pairs.append([query, full_text])
+                    pair_metadata.append((query_index, document_index))
+                    pair_len = len(self.model.tokenizer.encode(query, full_text, add_special_tokens=True, truncation=True, max_length=model_max_len))
+                    max_pair_tokens_observed = max(max_pair_tokens_observed, pair_len)
+                else:
+                    windows = []
+                    for i in range(0, len(doc_tokens), step):
+                        w_toks = doc_tokens[i : i + max_doc_tokens]
+                        w_text = self.model.tokenizer.decode(w_toks, skip_special_tokens=True)
+                        w_full_text = f"{prefix_header}{w_text}"
+                        windows.append(w_full_text)
+                        pair_len = len(self.model.tokenizer.encode(query, w_full_text, add_special_tokens=True, truncation=True, max_length=model_max_len))
+                        max_pair_tokens_observed = max(max_pair_tokens_observed, pair_len)
 
-                pair_metadata.append(
-                    (
-                        query_index,
-                        document_index,
-                    )
-                )
+                    for w in windows:
+                        pairs.append([query, w])
+                        pair_metadata.append((query_index, document_index))
 
-        logger.info(
-            f"Total Query-Document Pairs : "
-            f"{len(pairs)}"
-        )
+        logger.info(f"Reranker Model Max Seq Length : {model_max_len}")
+        logger.info(f"Maximum Query Token Count     : {max_query_tokens_observed}")
+        logger.info(f"Total Sub-Windows Scored      : {len(pairs)}")
+        logger.info(f"Maximum Actual Pair Tokens     : {max_pair_tokens_observed} / {model_max_len}")
+        logger.info(f"Tokenizer Overflow Detected    : {'NONE (0 pairs > ' + str(model_max_len) + ')' if max_pair_tokens_observed <= model_max_len else 'WARNING: OVERFLOW DETECTED'}")
 
         # ---------------------------------------------------------
         # CROSS-ENCODER PREDICTION
@@ -238,38 +253,20 @@ class DocumentReranker:
         logger.info("CROSS-ENCODER PREDICTION")
         logger.info("-" * 60)
 
-        scores = self.model.predict(
-            pairs
-        )
+        scores = self.model.predict(pairs)
 
-        logger.info(
-            "Cross-Encoder prediction completed."
-        )
+        logger.info("Cross-Encoder prediction completed.")
 
         # ---------------------------------------------------------
-        # GROUP SCORES BY DOCUMENT
+        # GROUP SCORES BY DOCUMENT (MAX-POOLED PER DOCUMENT)
         # ---------------------------------------------------------
 
-        document_scores = {
-            document_index: []
-            for document_index in range(
-                len(documents)
-            )
+        document_scores: dict[int, list[float]] = {
+            doc_idx: [] for doc_idx in range(len(documents))
         }
 
-        for score, (
-            query_index,
-            document_index,
-        ) in zip(
-            scores,
-            pair_metadata,
-        ):
-
-            document_scores[
-                document_index
-            ].append(
-                float(score)
-            )
+        for score, (query_index, document_index) in zip(scores, pair_metadata):
+            document_scores[document_index].append(float(score))
 
         # ---------------------------------------------------------
         # MULTI-QUERY SCORE AGGREGATION
@@ -353,12 +350,48 @@ class DocumentReranker:
         )
 
         # ---------------------------------------------------------
-        # SELECT TOP-K
+        # SELECT TOP-K WITH GATED PLAYBOOK SLOT RESERVATION
         # ---------------------------------------------------------
 
-        reranked_documents = scored_documents[
-            :top_k
+        all_playbook_candidates = [
+            doc for doc in scored_documents
+            if doc.metadata.get("source") == "IR_PLAYBOOKS" and doc.rerank_score is not None
         ]
+        if all_playbook_candidates:
+            pb_scores_str = ", ".join(
+                f"{doc.metadata.get('name', 'UNKNOWN')}={doc.rerank_score:.4f}"
+                for doc in all_playbook_candidates
+            )
+            logger.info(f"Playbook candidates considered ({len(all_playbook_candidates)} total): {pb_scores_str}")
+        else:
+            logger.info("Playbook candidates considered: None retrieved")
+
+        playbook_docs = [
+            doc for doc in all_playbook_candidates
+            if doc.rerank_score >= playbook_relevance_floor
+        ]
+
+        if min_playbook_slots > 0 and playbook_docs:
+            selected_playbook_docs = playbook_docs[:min_playbook_slots]
+            selected_ids = {id(doc) for doc in selected_playbook_docs}
+
+            remaining_slots = max(0, top_k - len(selected_playbook_docs))
+            remaining_docs = [
+                doc for doc in scored_documents
+                if id(doc) not in selected_ids
+            ]
+
+            reranked_documents = selected_playbook_docs + remaining_docs[:remaining_slots]
+            reranked_documents.sort(
+                key=lambda doc: doc.rerank_score if doc.rerank_score is not None else float("-inf"),
+                reverse=True,
+            )
+            logger.info(
+                f"Gated Playbook Allocation: Reserved {len(selected_playbook_docs)} IR_PLAYBOOKS "
+                f"doc(s) (score >= {playbook_relevance_floor})."
+            )
+        else:
+            reranked_documents = scored_documents[:top_k]
 
         # ---------------------------------------------------------
         # LOG TOP RESULTS

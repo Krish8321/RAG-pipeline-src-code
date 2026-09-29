@@ -193,6 +193,7 @@ class RetrievalPlanner:
                 {
                     "SIGMA_RULES",
                     "MITRE_ATTACK",
+                    "IR_PLAYBOOKS",
                 }
             )
 
@@ -224,7 +225,13 @@ class RetrievalPlanner:
             query_lower,
             technique_keywords,
         ):
-            sources.add("MITRE_ATTACK")
+            sources.update(
+                {
+                    "MITRE_ATTACK",
+                    "SIGMA_RULES",
+                    "IR_PLAYBOOKS",
+                }
+            )
 
             logger.debug(
                 "MITRE/Technique intent detected."
