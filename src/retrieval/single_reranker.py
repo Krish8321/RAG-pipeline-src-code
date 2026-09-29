@@ -73,7 +73,7 @@ class DocumentReranker:
         documents: list[RetrievedDocument],
         top_k: int = 10,
         min_playbook_slots: int = 1,
-        playbook_relevance_floor: float = 0.010,
+        playbook_relevance_floor: float = 0.10,
     ) -> list[RetrievedDocument]:
         """
         Re-rank retrieved documents using a single query.

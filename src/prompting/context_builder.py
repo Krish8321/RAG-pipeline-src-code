@@ -178,10 +178,13 @@ class ContextBuilder:
         is_supporting = rerank_score >= self.supporting_threshold
 
         # Relative threshold check against batch top score
+        min_top_for_relative_primary = self.primary_threshold * self.primary_relative_fraction
+        min_top_for_relative_supporting = self.supporting_threshold * self.supporting_relative_fraction
+
         if top_score is not None and top_score > 0:
-            if rerank_score >= top_score * self.primary_relative_fraction:
+            if top_score >= min_top_for_relative_primary and rerank_score >= top_score * self.primary_relative_fraction:
                 is_primary = True
-            elif rerank_score >= top_score * self.supporting_relative_fraction:
+            elif top_score >= min_top_for_relative_supporting and rerank_score >= top_score * self.supporting_relative_fraction:
                 is_supporting = True
 
         if is_primary:
@@ -211,15 +214,35 @@ class ContextBuilder:
 
         return f"general {document_type or source} reference material"
 
-    def _extract_technique_consensus(
+    def _extract_technique_support(
         self,
         primary_docs: list[dict[str, Any]],
-    ) -> str | None:
+    ) -> dict[str, Any]:
+        """
+        Extract MITRE ATT&CK technique support across primary tier documents.
+
+        Classifies technique support as:
+        - UNANIMOUS (100% of primary docs) -> +15 boost
+        - MAJORITY (>50% of primary docs)  -> +15 boost
+        - PARTIAL  (=50% of primary docs)  -> +5 boost
+        - MINORITY (<50% of primary docs)  -> +0 boost
+        - NONE     (0 primary docs or no technique IDs found) -> +0 boost
+        """
         if not primary_docs:
-            return None
+            return {
+                "status": "NONE",
+                "top_technique": None,
+                "counts": {},
+                "fraction": 0.0,
+                "total_primary": 0,
+                "boost": 0,
+                "description": "No primary evidence documents available",
+                "techniques_by_doc": [],
+            }
 
         pattern = re.compile(r"(?:attack\.t|\bT)(\d{4}(?:\.\d{3})?)\b", re.IGNORECASE)
         tech_counts: dict[str, int] = {}
+        techniques_by_doc: list[set[str]] = []
 
         for doc in primary_docs:
             doc_text = doc.get("document", "")
@@ -231,20 +254,60 @@ class ContextBuilder:
                 tech_id = f"T{match.group(1).upper()}"
                 found_in_doc.add(tech_id)
 
+            techniques_by_doc.append(found_in_doc)
             for tech_id in found_in_doc:
                 tech_counts[tech_id] = tech_counts.get(tech_id, 0) + 1
 
+        total_primary = len(primary_docs)
         if not tech_counts:
-            return None
+            return {
+                "status": "NONE",
+                "top_technique": None,
+                "counts": {},
+                "fraction": 0.0,
+                "total_primary": total_primary,
+                "boost": 0,
+                "description": "No explicit MITRE technique IDs found in primary evidence",
+                "techniques_by_doc": techniques_by_doc,
+            }
 
         top_tech, max_count = max(tech_counts.items(), key=lambda item: item[1])
-        total_primary = len(primary_docs)
+        fraction = max_count / total_primary
 
-        if max_count / total_primary >= 0.5:
-            consensus_str = f"{top_tech} (cited in {max_count}/{total_primary} primary documents)"
-            logger.info(f"Technique Consensus Extracted: {consensus_str}")
-            return consensus_str
+        if fraction == 1.0:
+            status = "UNANIMOUS"
+            boost = 15
+        elif fraction > 0.5:
+            status = "MAJORITY"
+            boost = 15
+        elif fraction == 0.5:
+            status = "PARTIAL"
+            boost = 5
+        else:
+            status = "MINORITY"
+            boost = 0
 
+        description = f"{top_tech} ({status} support: cited in {max_count}/{total_primary} primary documents)"
+        logger.info(f"Technique Support Extracted: {description}")
+
+        return {
+            "status": status,
+            "top_technique": top_tech,
+            "counts": tech_counts,
+            "fraction": fraction,
+            "total_primary": total_primary,
+            "boost": boost,
+            "description": description,
+            "techniques_by_doc": techniques_by_doc,
+        }
+
+    def _extract_technique_consensus(
+        self,
+        primary_docs: list[dict[str, Any]],
+    ) -> str | None:
+        info = self._extract_technique_support(primary_docs)
+        if info["status"] in ("UNANIMOUS", "MAJORITY", "PARTIAL"):
+            return info["description"]
         return None
 
     def build(
@@ -265,6 +328,10 @@ class ContextBuilder:
             Structured evidence context containing:
             - `documents`: list of structured evidence dicts
             - `technique_consensus`: optional MITRE consensus string
+            - `computed_risk_score`: deterministic risk score (0-100)
+            - `risk_breakdown`: structured score breakdown
+            - `risk_factors`: human-readable list of risk factors
+            - `escalation_recommendation`: escalation level string
         """
 
         if documents is None:
@@ -383,21 +450,10 @@ class ContextBuilder:
             f"unscored={tier_counts['unscored']}"
         )
 
-        # ---------------------------------------------------------
-        # DROP NOISE-FLOOR DOCUMENTS
-        #
-        # `context` is still sorted best-first (rank 1 = highest
-        # score) at this point. Documents scoring below noise_floor
-        # are dropped outright rather than sent to the LLM tagged
-        # "contextual" -- a tier label is advice the model can
-        # ignore, but a document that was never in the prompt can't
-        # be hallucinated into "Observed Evidence."
-        # ---------------------------------------------------------
-
         def _above_noise_floor(item: dict[str, Any]) -> bool:
             score = item["rerank_score"]
             if item.get("source") == "IR_PLAYBOOKS":
-                return score is not None and score >= 0.0001
+                return score is not None and score >= 0.10
             return score is not None and score >= self.noise_floor
 
         kept = [item for item in context if _above_noise_floor(item)]
@@ -421,13 +477,6 @@ class ContextBuilder:
 
         final_context = kept
 
-        # ---------------------------------------------------------
-        # PRIMARY TIER EXCLUSION
-        #
-        # If there are enough PRIMARY tier documents (>= min_primary_for_exclusion),
-        # drop SUPPORTING and CONTEXTUAL tier documents entirely to prevent
-        # 8B local models from anchoring on lower-tier evidence.
-        # ---------------------------------------------------------
         primary_docs = [doc for doc in final_context if doc.get("relevance_tier") == "primary"]
         if self.min_primary_for_exclusion > 0 and len(primary_docs) >= self.min_primary_for_exclusion:
             logger.info(
@@ -437,13 +486,6 @@ class ContextBuilder:
             )
             final_context = primary_docs
 
-        # ---------------------------------------------------------
-        # REORDER FOR RECENCY (see reorder_for_recency docstring)
-        #
-        # `rank` is left untouched so it still communicates true
-        # relevance order regardless of position in the list.
-        # ---------------------------------------------------------
-
         if self.reorder_for_recency:
             final_context = list(reversed(final_context))
             logger.info(
@@ -451,11 +493,23 @@ class ContextBuilder:
                 "placed last (closest to generation instructions)."
             )
 
-        technique_consensus = self._extract_technique_consensus(primary_docs)
+        technique_support_info = self._extract_technique_support(primary_docs)
+        technique_consensus = (
+            technique_support_info.get("description")
+            if technique_support_info.get("status") in ("UNANIMOUS", "MAJORITY", "PARTIAL")
+            else None
+        )
 
-        computed_risk_score, risk_factors, escalation_recommendation = self._compute_risk_and_escalation(
+        (
+            computed_risk_score,
+            risk_breakdown,
+            risk_factors,
+            escalation_recommendation,
+            primary_severity_summary,
+            supporting_severity_summary,
+        ) = self._compute_risk_and_escalation(
             documents=final_context,
-            technique_consensus=technique_consensus,
+            technique_support_info=technique_support_info,
         )
 
         logger.info(f"Computed Deterministic Risk Score : {computed_risk_score}/100")
@@ -468,76 +522,151 @@ class ContextBuilder:
         return {
             "documents": final_context,
             "technique_consensus": technique_consensus,
+            "technique_support_info": technique_support_info,
             "computed_risk_score": computed_risk_score,
+            "risk_breakdown": risk_breakdown,
             "risk_factors": risk_factors,
+            "primary_severity_summary": primary_severity_summary,
+            "supporting_severity_summary": supporting_severity_summary,
             "escalation_recommendation": escalation_recommendation,
         }
 
     def _compute_risk_score(
         self,
         documents: list[dict[str, Any]],
-        technique_consensus: str | None,
+        technique_consensus: str | None = None,
     ) -> int:
-        score, _, _ = self._compute_risk_and_escalation(documents, technique_consensus)
+        score, _, _, _, _, _ = self._compute_risk_and_escalation(documents)
         return score
 
     def _compute_risk_and_escalation(
         self,
         documents: list[dict[str, Any]],
-        technique_consensus: str | None,
-    ) -> tuple[int, list[str], str]:
+        technique_support_info: dict[str, Any] | None = None,
+    ) -> tuple[int, dict[str, Any], list[str], str, str, str]:
         """
         Compute a transparent, deterministic 0-100 risk score, explicit risk factors,
         and escalation recommendation based on evidence severity, primary coverage,
-        technique consensus, and alert signals.
+        technique support classification, and alert signals.
         """
+        if technique_support_info is None:
+            primary_docs = [d for d in documents if d.get("relevance_tier") == "primary" and d.get("source") != "IR_PLAYBOOKS"]
+            technique_support_info = self._extract_technique_support(primary_docs)
+
         severity_map = {
             "critical": 100,
             "high": 75,
             "medium": 50,
             "low": 25,
         }
-        base_score = 50
-        risk_factors = []
 
-        found_severities = []
+        # 1. Tiered Evidence Severity
+        primary_sevs = []
+        supporting_sevs = []
+
         for doc in documents:
+            if doc.get("source") == "IR_PLAYBOOKS":
+                continue
+            tier = doc.get("relevance_tier", "contextual")
             text = f"{doc.get('name', '')}\n{doc.get('document', '')}".lower()
             for sev_name, score in severity_map.items():
-                if f"severity level: {sev_name}" in text or f"severity: {sev_name}" in text:
-                    found_severities.append((score, sev_name.upper(), doc.get("name", "Unknown Rule")))
+                if f"severity level: {sev_name}" in text or f"severity: {sev_name}" in text or f"severity {sev_name}" in text:
+                    item = (score, sev_name.upper(), doc.get("name", "Unknown Rule"))
+                    if tier == "primary":
+                        primary_sevs.append(item)
+                    elif tier == "supporting":
+                        supporting_sevs.append(item)
 
-        if found_severities:
-            max_sev_score, max_sev_name, rule_name = max(found_severities, key=lambda x: x[0])
-            base_score = max_sev_score
-            risk_factors.append(f"Retrieved detection rule severity: {max_sev_name} ({rule_name})")
+        primary_max_item = max(primary_sevs, key=lambda x: x[0]) if primary_sevs else None
+        supporting_max_item = max(supporting_sevs, key=lambda x: x[0]) if supporting_sevs else None
+
+        primary_max_name = primary_max_item[1] if primary_max_item else None
+        supporting_max_name = supporting_max_item[1] if supporting_max_item else None
+
+        # Base score is strictly driven by primary tier max severity
+        if primary_max_item:
+            base_score = primary_max_item[0]
         else:
-            risk_factors.append("No explicit detection severity in evidence (default base score 50)")
+            base_score = 50
 
-        score = base_score
+        # Supporting tier evidence cannot set base_score, but supporting HIGH/CRITICAL gives +5 context boost
+        supporting_boost = 0
+        if supporting_max_name in ("CRITICAL", "HIGH"):
+            supporting_boost = 5
 
-        if technique_consensus:
-            score += 15
-            risk_factors.append(f"MITRE ATT&CK technique consensus confirmed ({technique_consensus})")
+        # 2. Technique Support Boost
+        technique_boost = technique_support_info.get("boost", 0)
+        technique_status = technique_support_info.get("status", "NONE")
 
-        primary_count = sum(1 for d in documents if d.get("relevance_tier") == "primary")
+        # 3. Multi-Primary Evidence Boost
+        primary_docs = [d for d in documents if d.get("relevance_tier") == "primary" and d.get("source") != "IR_PLAYBOOKS"]
+        primary_count = len(primary_docs)
+        multi_primary_boost = 0
+
         if primary_count > 1:
-            boost = min(10, (primary_count - 1) * 5)
-            score += boost
-            risk_factors.append(f"Multiple primary evidence rules matched ({primary_count} rules)")
+            tech_sets = technique_support_info.get("techniques_by_doc", [])
+            non_empty_tech_sets = [ts for ts in tech_sets if ts]
+            if len(non_empty_tech_sets) > 1 and len(set.intersection(*non_empty_tech_sets)) > 0:
+                multi_primary_boost = 5  # Overlapping rules for same MITRE technique
+            elif len(non_empty_tech_sets) > 1:
+                multi_primary_boost = 10 # Distinct rules across different MITRE techniques
+            else:
+                multi_primary_boost = 5  # Default multi-primary rule boost
 
+        # 4. Signal Modifiers
+        exfil_signal = False
         for doc in documents:
             text = doc.get("document", "").lower()
             if "exfiltration" in text or "data leak" in text or "upload" in text:
-                score += 10
-                risk_factors.append("Retrieved evidence indicates potential data exfiltration signal")
+                exfil_signal = True
                 break
 
-        if primary_count == 0:
-            score -= 10
-            risk_factors.append("No primary tier direct matches in retrieval")
+        no_primary_signal = (primary_count == 0)
 
-        final_score = min(100, max(10, score))
+        signal_modifiers = 0
+        if exfil_signal:
+            signal_modifiers += 10
+        if no_primary_signal:
+            signal_modifiers -= 10
+
+        calculated_total = base_score + supporting_boost + technique_boost + multi_primary_boost + signal_modifiers
+        final_score = min(100, max(10, calculated_total))
+
+        risk_breakdown = {
+            "base_score": base_score,
+            "primary_severity": primary_max_name or "NONE",
+            "supporting_severity": supporting_max_name or "NONE",
+            "supporting_boost": supporting_boost,
+            "technique_support_status": technique_status,
+            "technique_boost": technique_boost,
+            "multi_primary_boost": multi_primary_boost,
+            "signal_modifiers": signal_modifiers,
+            "final_score": final_score,
+        }
+
+        risk_factors = []
+        if primary_max_item:
+            risk_factors.append(f"Primary detection rule severity: {primary_max_name} ({primary_max_item[2]})")
+        else:
+            risk_factors.append("No explicit primary detection severity in evidence (default base score 50)")
+
+        if supporting_boost > 0:
+            risk_factors.append(f"Supporting evidence context boost ({supporting_max_name}): +{supporting_boost}")
+
+        if technique_status != "NONE":
+            desc = technique_support_info.get("description", "")
+            risk_factors.append(f"MITRE ATT&CK technique support ({desc}): +{technique_boost}")
+
+        if multi_primary_boost == 10:
+            risk_factors.append(f"Multiple primary evidence rules across distinct MITRE techniques ({primary_count} rules): +10")
+        elif multi_primary_boost == 5:
+            risk_factors.append(f"Multiple primary evidence rules for same MITRE technique ({primary_count} rules): +5")
+
+        if exfil_signal:
+            risk_factors.append("Retrieved evidence indicates potential data exfiltration signal: +10")
+
+        if no_primary_signal:
+            risk_factors.append("No primary tier direct matches in retrieval: -10")
 
         if final_score >= 90:
             escalation = "Escalate to Tier-2 / Analyst Investigation Required"
@@ -548,4 +677,4 @@ class ContextBuilder:
         else:
             escalation = "Monitor — Low Risk / No Action Required"
 
-        return final_score, risk_factors, escalation
+        return final_score, risk_breakdown, risk_factors, escalation, primary_max_name or "NONE", supporting_max_name or "NONE"

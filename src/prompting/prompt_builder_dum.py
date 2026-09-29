@@ -29,26 +29,13 @@ OPTIONAL_DOCUMENT_FIELDS = (
 )
 
 
+from src.utils.alert_parser import parse_alert
+
+
 class PromptBuilder:
     """
     Builds the final ARIA LLM prompt from an alert and
     structured RAG context.
-
-    Responsibilities
-    ----------------
-    - Load the Jinja2 prompt template.
-    - Inject the alert text and optional alert metadata.
-    - Inject structured retrieved evidence.
-    - Render the final prompt.
-
-    Does NOT
-    --------
-    - Retrieve documents.
-    - Generate queries.
-    - Deduplicate documents.
-    - Rerank documents.
-    - Build or modify security evidence.
-    - Call the LLM.
     """
 
     def __init__(
@@ -114,9 +101,7 @@ class PromptBuilder:
     ) -> None:
         """
         Validate that every document in context has the fields the
-        template renders unconditionally. Raising here with a clear
-        message is much easier to debug than a StrictUndefined
-        traceback from inside Jinja.
+        template renders unconditionally.
         """
 
         for index, document in enumerate(context):
@@ -146,17 +131,6 @@ class PromptBuilder:
     ) -> list[dict[str, Any]]:
         """
         Ensure optional fields exist on every document before render.
-
-        With `StrictUndefined`, a bare `{% if result.matched_behavior %}`
-        raises the instant the key is missing, because boolean
-        coercion touches the Undefined object directly — unlike the
-        `| default(...)` filter, which checks "is this undefined"
-        first and never triggers the raise. Rather than relying on
-        every template author to remember that distinction, we
-        guarantee the keys exist here so either template style is
-        safe.
-
-        Returns new dicts; does not mutate the caller's context list.
         """
 
         normalized = []
@@ -178,28 +152,6 @@ class PromptBuilder:
     ) -> str:
         """
         Build the final ARIA LLM prompt.
-
-        Parameters
-        ----------
-        alert_text
-            Original security alert text. Rendered into the template's
-            `alert_text` variable.
-
-        context
-            Structured evidence produced by ContextBuilder (dict or list).
-            Rendered into the template's `retrieved_documents` and
-            `technique_consensus` variables.
-
-        alert_metadata
-            Optional dict of alert-level metadata.
-
-        technique_consensus
-            Optional MITRE technique consensus string.
-
-        Returns
-        -------
-        str
-            Fully rendered LLM prompt.
         """
 
         if alert_text is None:
@@ -222,14 +174,28 @@ class PromptBuilder:
                 "Context cannot be None."
             )
 
+        parsed_alert = parse_alert(alert_metadata if isinstance(alert_metadata, dict) else alert_text)
+        effective_metadata = dict(parsed_alert.metadata_dict)
+        if alert_metadata:
+            effective_metadata.update(alert_metadata)
+
         computed_risk_score = 50
         risk_factors = []
         escalation_recommendation = "Escalate to Tier-2 Analyst Review"
+        technique_support_info = {}
+        risk_breakdown = {}
+        primary_severity_summary = "NONE"
+        supporting_severity_summary = "NONE"
+
         if isinstance(context, dict):
             documents = context.get("documents", [])
             technique_consensus = context.get("technique_consensus", technique_consensus)
+            technique_support_info = context.get("technique_support_info", {})
             computed_risk_score = context.get("computed_risk_score", 50)
+            risk_breakdown = context.get("risk_breakdown", {})
             risk_factors = context.get("risk_factors", [])
+            primary_severity_summary = context.get("primary_severity_summary", "NONE")
+            supporting_severity_summary = context.get("supporting_severity_summary", "NONE")
             escalation_recommendation = context.get("escalation_recommendation", "Escalate to Tier-2 / Analyst Investigation Required")
         elif isinstance(context, list):
             documents = context
@@ -257,7 +223,7 @@ class PromptBuilder:
         )
 
         logger.info(
-            f"Alert Metadata : {alert_metadata or {}}"
+            f"Alert Metadata : {effective_metadata}"
         )
 
         logger.info(
@@ -279,11 +245,19 @@ class PromptBuilder:
 
         prompt = self.template.render(
             alert_text=alert_text,
-            alert_metadata=alert_metadata,
+            alert_metadata=effective_metadata,
+            parsed_alert=parsed_alert,
+            upstream_risk_score=parsed_alert.upstream_risk_score,
+            upstream_mitre_techniques=parsed_alert.upstream_mitre_techniques,
+            formatted_telemetry=parsed_alert.formatted_telemetry,
             retrieved_documents=normalized_context,
             technique_consensus=technique_consensus,
+            technique_support_info=technique_support_info,
             computed_risk_score=computed_risk_score,
+            risk_breakdown=risk_breakdown,
             risk_factors=risk_factors,
+            primary_severity_summary=primary_severity_summary,
+            supporting_severity_summary=supporting_severity_summary,
             escalation_recommendation=escalation_recommendation,
         )
 

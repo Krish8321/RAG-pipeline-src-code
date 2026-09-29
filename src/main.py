@@ -33,18 +33,41 @@ def main() -> None:
     # ============================================================
     # 1. USER SECURITY QUERY
     # ============================================================
+    alert = {
+        "timestamp": "2026-09-29T07:51:33.085198+00:00",
+        "prediction_class": 1,
+        "triage_action": "ESCALATE — automated model flagged anomalous behaviour",
+        "risk_score": 0.85,
+        "mitre_techniques": [
+            "T1059 — Command & Scripting Interpreter",
+            "T1071 — Application Layer Protocol"
+        ],
+        "iocs_extracted": {
+            "agent_name": "Victus_host",
+            "agent_ip": "127.0.0.1",
+            "feature_snapshot": {
+                "Network_I_ActiveNIC_TCP_APS": 9430.0,
+                "Process_Pool_Paged Bytes": 127588240.0,
+                "Process_Handle Count": 183315.0,
+                "Memory Free System Page Table Entries": 4288201244.0,
+                "Process_Virtual_Bytes": 609522551930880.0,
+                "Memory System Cache Resident Bytes": 168275968.0,
+                "Process_Virtual_Bytes Peak": 611769608167424.0,
+                "Process_Thread Count": 5831.0,
+                "Process_Working Set": 15218671616.0,
+                "Process_Working_Set_Peak": 39099113472.0,
+                "Network_I_ActiveNIC_ TCP Active RSC Connections": 0.0,
+                "Process_Page_File Bytes": 20492898304.0,
+                "Process_Working_Set_ Private": 7479660544.0,
+                "Memory Standby Cache Normal Priority Bytes": 2349830144.0,
+                "Network_I_ActiveNIC_ Bytes Sent sec": 0.0
+            }
+        },
+        "ai_reasoning": "Random Forest predicted class 1 (non-zero -> anomalous). Top contributing features: Network_I_ActiveNIC_TCP_APS=9430.00, Process_Thread Count=5831.00, Process_Working Set=15218671616.00.",
+        "source_event_id": "1790668292.222204"
+    }
 
-    user_query = (
-        "Suspicious PowerShell encoded payload A-003 · 14:27:14 · WS-ACCT-021"
-    )
-    
-    # user_query = (
-    #     "Failed MFA push: 12 notifications in 3 mins A-005 · 14:18:47 · user: j.chen@corp.com"
-    # )
-    
-    # user_query = (
-    #     "Data exfiltration: 4.2 GB upload to Mega.nz A-004 · 14:25:33 · 192.168.5.103"
-    # )
+    user_query = f"Anomalous host activity on Victus_host (127.0.0.1) - Event ID {alert['source_event_id']} - T1059 T1071"
 
     # ============================================================
     # 2. INITIALIZE COMPONENTS
@@ -152,6 +175,7 @@ def main() -> None:
     prompt = prompt_builder.build(
         alert_text=user_query,
         context=context,
+        alert_metadata=alert,
     )
 
     # ============================================================

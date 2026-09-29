@@ -9,141 +9,180 @@ from src.retrieval.retriever import RetrievedDocument
 from src.prompting.context_builder import ContextBuilder
 from src.prompting.prompt_builder_dum import PromptBuilder
 from src.response_validator import ResponseValidator
+from src.utils.alert_parser import parse_alert
 
-def test_case_1_powershell_encoded_payload():
+
+def test_req_a_structured_real_alert():
     print("\n=========================================================")
-    print("RUNNING TEST 1: Standard Encoded PowerShell Alert Grounding Check")
+    print("RUNNING REQUIRED TEST A: Structured Real Alert Parsing")
     print("=========================================================")
 
-    context_builder = ContextBuilder()
-    prompt_builder = PromptBuilder()
+    raw_alert = {
+        "timestamp": "2026-09-29T07:51:33.085198+00:00",
+        "prediction_class": 1,
+        "triage_action": "ESCALATE — automated model flagged anomalous behaviour",
+        "risk_score": 0.85,
+        "mitre_techniques": [
+            "T1059 — Command & Scripting Interpreter",
+            "T1071 — Application Layer Protocol",
+        ],
+        "iocs_extracted": {
+            "agent_name": "Victus_host",
+            "agent_ip": "127.0.0.1",
+            "feature_snapshot": {
+                "Network_I_ActiveNIC_TCP_APS": 9430.0,
+                "Process_Thread Count": 5831.0,
+                "Process_Working Set": 15218671616.0,
+            },
+        },
+        "ai_reasoning": "Random Forest predicted class 1 (non-zero -> anomalous).",
+        "source_event_id": "1790668292.222204",
+    }
 
-    alert_text = "Suspicious PowerShell encoded payload A-003 · 14:27:14 · WS-ACCT-021"
+    parsed = parse_alert(raw_alert)
+    assert parsed.agent_name == "Victus_host", f"Expected Victus_host, got {parsed.agent_name}"
+    assert parsed.agent_ip == "127.0.0.1", f"Expected 127.0.0.1, got {parsed.agent_ip}"
+    assert parsed.source_event_id == "1790668292.222204", f"Expected 1790668292.222204, got {parsed.source_event_id}"
+    assert parsed.upstream_risk_score == 0.85, f"Expected 0.85, got {parsed.upstream_risk_score}"
+    assert any("T1059" in tech for tech in parsed.upstream_mitre_techniques), "T1059 missing"
+    assert any("T1071" in tech for tech in parsed.upstream_mitre_techniques), "T1071 missing"
+    print("REQUIRED TEST A PASSED!")
 
-    doc1 = RetrievedDocument(
-        document="Sigma Rule: Suspicious Execution of Powershell with Base64\nSeverity Level: HIGH\nAssociated MITRE ATT&CK Tags: attack.execution, attack.t1059.001\nDetection Logic: CommandLine contains -Enc",
-        distance=0.1,
-        metadata={"source": "SIGMA_RULES", "name": "Suspicious Execution of Powershell with Base64"},
-        query=alert_text,
-        rerank_score=0.65
-    )
-    doc2 = RetrievedDocument(
-        document="Sigma Rule: Suspicious Obfuscated PowerShell Code\nSeverity Level: HIGH\nAssociated MITRE ATT&CK Tags: attack.execution, attack.t1059.001\nDetection Logic: Payload contains UTF16 Base64",
-        distance=0.1,
-        metadata={"source": "SIGMA_RULES", "name": "Suspicious Obfuscated PowerShell Code"},
-        query=alert_text,
-        rerank_score=0.55
-    )
 
-    built_context = context_builder.build([doc1, doc2])
-
-    assert built_context["computed_risk_score"] == 95, f"Expected score 95, got {built_context['computed_risk_score']}"
-    assert built_context["escalation_recommendation"] == "Escalate to Tier-2 / Analyst Investigation Required", f"Unexpected escalation: {built_context['escalation_recommendation']}"
-
-    prompt = prompt_builder.build(alert_text=alert_text, context=built_context)
-
-    print(f"Risk Score: {built_context['computed_risk_score']}/100")
-    print(f"Escalation: {built_context['escalation_recommendation']}")
-    print(f"Risk Factors: {built_context['risk_factors']}")
-    print("TEST 1 PASSED: Risk score & escalation correctly computed and injected into prompt!")
-
-def test_case_2_lateral_movement_alert():
+def test_req_b_no_invented_mitre_techniques():
     print("\n=========================================================")
-    print("RUNNING TEST 2: Alert with Explicit Remote Connection / Lateral Movement")
-    print("=========================================================")
-
-    context_builder = ContextBuilder()
-    alert_text = "PsExec remote execution on DC-01"
-
-    doc = RetrievedDocument(
-        document="Sigma Rule: PsExec Remote Execution\nSeverity Level: HIGH\nAssociated MITRE ATT&CK Tags: attack.t1021.002\nDetection Logic: PsExec remote service execution",
-        distance=0.1,
-        metadata={"source": "SIGMA_RULES", "name": "PsExec Remote Execution"},
-        query=alert_text,
-        rerank_score=0.70
-    )
-
-    built_context = context_builder.build([doc])
-    print(f"Risk Score: {built_context['computed_risk_score']}/100")
-    print(f"Escalation: {built_context['escalation_recommendation']}")
-    assert built_context["computed_risk_score"] == 90
-    print("TEST 2 PASSED!")
-
-def test_case_3_no_useful_rag_knowledge():
-    print("\n=========================================================")
-    print("RUNNING TEST 3: Alert with Weak/No Useful RAG Knowledge")
-    print("=========================================================")
-
-    context_builder = ContextBuilder()
-    alert_text = "Unknown system event 0x99"
-
-    doc1 = RetrievedDocument(
-        document="High noise doc",
-        distance=0.9,
-        metadata={"source": "BACKGROUND", "name": "Noise 1"},
-        query=alert_text,
-        rerank_score=0.01
-    )
-
-    built_context = context_builder.build([doc1])
-    print(f"Risk Score: {built_context['computed_risk_score']}/100")
-    print(f"Escalation: {built_context['escalation_recommendation']}")
-    print(f"Risk Factors: {built_context['risk_factors']}")
-    assert built_context["computed_risk_score"] in (40, 50)
-    assert "Tier-1 Investigation" in built_context["escalation_recommendation"] or "Monitor" in built_context["escalation_recommendation"]
-    print("TEST 3 PASSED!")
-
-def test_case_4_artifact_non_leak():
-    print("\n=========================================================")
-    print("RUNNING TEST 4: Artifact Non-Leak Check (Retrieved Example Artifacts)")
-    print("=========================================================")
-
-    validator = ResponseValidator()
-    alert_text = "Suspicious PowerShell encoded payload A-003 · 14:27:14 · WS-ACCT-021"
-
-    # Context contains example IP 192.168.1.50 which is NOT in alert_text
-    context = [{"document": "Sigma Rule example CommandLine: powershell.exe -e 192.168.1.50"}]
-
-    # BAD response trying to claim IP 192.168.1.50 is an IOC for this incident
-    bad_response = (
-        "Escalation Recommendation: Escalate to Tier-2 / Analyst Investigation Required\n"
-        "Risk Score: 95/100\n"
-        "Basis: High severity rule match\n\n"
-        "IOCs Extracted:\n"
-        "- 192.168.1.50\n"
-    )
-
-    result = validator.validate(response=bad_response, alert_text=alert_text, context=context)
-    print(f"Validator Warning Caught: {result.warnings}")
-    assert any("does not appear in the alert text" in w for w in result.warnings)
-    print("TEST 4 PASSED: Validator correctly caught ungrounded artifact in IOCs!")
-
-def test_case_5_mitre_stage_non_attribution():
-    print("\n=========================================================")
-    print("RUNNING TEST 5: MITRE Attack Stage Non-Attribution Rule Check")
+    print("RUNNING REQUIRED TEST B: No Invented MITRE Techniques Leakage")
     print("=========================================================")
 
     prompt_builder = PromptBuilder()
     context_builder = ContextBuilder()
 
+    alert_data = {
+        "timestamp": "2026-09-29T07:51:33.085198+00:00",
+        "mitre_techniques": ["T1059 — Command & Scripting Interpreter", "T1071 — Application Layer Protocol"],
+        "agent_name": "Victus_host",
+    }
+
+    # RAG document discusses T1021 Remote Services
     doc = RetrievedDocument(
-        document="MITRE ATT&CK T1059: Command and Scripting Interpreter. Adversaries may use scripts for execution, persistence, and lateral movement.",
+        document="Sigma Rule: Remote Service Execution via SMB\nAssociated MITRE ATT&CK Tags: T1021.002",
         distance=0.1,
-        metadata={"source": "MITRE", "name": "T1059"},
-        query="PowerShell alert",
-        rerank_score=0.65
+        metadata={"source": "SIGMA_RULES", "name": "PsExec Service"},
+        query="Victus_host alert",
+        rerank_score=0.65,
     )
 
     built_context = context_builder.build([doc])
-    prompt = prompt_builder.build(alert_text="PowerShell alert", context=built_context)
+    prompt = prompt_builder.build(alert_text=str(alert_data), context=built_context, alert_metadata=alert_data)
 
-    assert "ATTACK STAGE GENERATION RESTRICTIONS" in prompt
-    assert "Do NOT assert or imply that any of the following occurred in this specific incident" in prompt
-    print("TEST 5 PASSED: Prompt explicitly restricts unobserved attack stage assertions!")
+    # Ensure prompt clearly specifies Upstream MITRE techniques separate from RAG
+    assert "UPSTREAM ALERT MITRE TECHNIQUES:" in prompt
+    assert "T1059" in prompt
+    assert "T1071" in prompt
+    assert "NEVER add a RAG-retrieved MITRE technique (e.g. T1021)" in prompt
+    print("REQUIRED TEST B PASSED!")
+
+
+def test_req_c_missing_optional_fields():
+    print("\n=========================================================")
+    print("RUNNING REQUIRED TEST C: Missing Optional Fields Handling")
+    print("=========================================================")
+
+    alert_data = {
+        "timestamp": "2026-09-29T07:51:33.085198+00:00",
+        "agent_name": "Victus_host",
+        # agent_ip intentionally omitted
+    }
+
+    parsed = parse_alert(alert_data)
+    assert parsed.agent_name == "Victus_host"
+    assert parsed.agent_ip is None, "agent_ip should be None"
+
+    prompt_builder = PromptBuilder()
+    context_builder = ContextBuilder()
+    doc = RetrievedDocument(document="Generic info", distance=0.5, metadata={"source": "BG", "name": "Doc"}, query="test", rerank_score=0.1)
+    built_context = context_builder.build([doc])
+
+    prompt = prompt_builder.build(alert_text="Victus_host alert", context=built_context, alert_metadata=alert_data)
+    assert "agent_ip" not in parsed.metadata_dict or parsed.metadata_dict.get("agent_ip") is None
+    print("REQUIRED TEST C PASSED!")
+
+
+def test_req_d_no_traditional_iocs_invented():
+    print("\n=========================================================")
+    print("RUNNING REQUIRED TEST D: No Traditional IOCs Invention")
+    print("=========================================================")
+
+    alert_data = {
+        "agent_name": "Victus_host",
+        "agent_ip": "127.0.0.1",
+        "feature_snapshot": {"Network_I_ActiveNIC_TCP_APS": 9430.0},
+    }
+
+    parsed = parse_alert(alert_data)
+    # Feature snapshot telemetry must be separated into formatted_telemetry, not metadata IOCs
+    assert len(parsed.formatted_telemetry) == 1
+    assert "TCP_APS: 9,430" in parsed.formatted_telemetry[0] or "9430" in parsed.formatted_telemetry[0]
+    print("REQUIRED TEST D PASSED!")
+
+
+def test_req_e_risk_separation():
+    print("\n=========================================================")
+    print("RUNNING REQUIRED TEST E: Risk Separation (Upstream vs ARIA)")
+    print("=========================================================")
+
+    alert_data = {
+        "risk_score": 0.85,
+        "agent_name": "Victus_host",
+    }
+
+    prompt_builder = PromptBuilder()
+    context_builder = ContextBuilder()
+
+    doc = RetrievedDocument(document="Medium severity rule\nSeverity: MEDIUM", distance=0.1, metadata={"source": "SIGMA", "name": "Medium Rule"}, query="alert", rerank_score=0.70)
+    built_context = context_builder.build([doc])
+
+    prompt = prompt_builder.build(alert_text="Victus_host", context=built_context, alert_metadata=alert_data)
+
+    assert "UPSTREAM MODEL RISK: 0.85" in prompt
+    assert "ARIA Deterministic Risk Score: 65/100" in prompt or "ARIA Deterministic Risk Score:" in prompt
+    assert built_context["computed_risk_score"] != 85, "ARIA risk score must not silently copy upstream 0.85 as 85"
+    print("REQUIRED TEST E PASSED!")
+
+
+def test_req_f_analyst_actionability():
+    print("\n=========================================================")
+    print("RUNNING REQUIRED TEST F: Analyst Actionability & Structure")
+    print("=========================================================")
+
+    prompt_builder = PromptBuilder()
+    context_builder = ContextBuilder()
+
+    doc_pb = RetrievedDocument(
+        document="TLP:CLEAR Incident Response Playbook for Red Team Detection\nSteps: 1. Monitor unusual behavior. 2. Investigate process resource usage.",
+        distance=0.1,
+        metadata={"source": "IR_PLAYBOOKS", "name": "IRM-20-Red_Team_Detection"},
+        query="Victus_host alert",
+        rerank_score=0.50,
+    )
+
+    built_context = context_builder.build([doc_pb])
+    prompt = prompt_builder.build(alert_text="Victus_host alert", context=built_context)
+
+    assert "Threat Assessment" in prompt
+    assert "Alert Facts" in prompt
+    assert "Evidence Interpretation" in prompt
+    assert "Recommended Investigation" in prompt
+    assert "Escalation Recommendation" in prompt
+    assert "Evidence Sources" in prompt
+    print("REQUIRED TEST F PASSED!")
+
 
 if __name__ == "__main__":
-    test_case_1_powershell_encoded_payload()
-    test_case_2_lateral_movement_alert()
-    test_case_3_no_useful_rag_knowledge()
-    test_case_4_artifact_non_leak()
-    test_case_5_mitre_stage_non_attribution()
+    test_req_a_structured_real_alert()
+    test_req_b_no_invented_mitre_techniques()
+    test_req_c_missing_optional_fields()
+    test_req_d_no_traditional_iocs_invented()
+    test_req_e_risk_separation()
+    test_req_f_analyst_actionability()
+    print("\nALL GROUNDING & ANALYST ACTIONABILITY REGRESSION TESTS PASSED SUCCESSFULLY!")

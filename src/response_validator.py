@@ -29,6 +29,7 @@ KNOWN_TECHNIQUES: dict[str, str] = {
     "T1569.002": "Service Execution",
     "T1059": "Command and Scripting Interpreter",
     "T1059.001": "PowerShell",
+    "T1071": "Application Layer Protocol",
     "T1053": "Scheduled Task/Job",
     "T1047": "Windows Management Instrumentation",
     "T1003": "OS Credential Dumping",
@@ -75,7 +76,7 @@ THREAT_ACTOR_MALWARE_PATTERN = re.compile(
 )
 
 SECTION_HEADER_PATTERN = re.compile(
-    r"^(?:\#+\s*)?(Observed Evidence|IOCs|IOCs Extracted|AI Reasoning|RAG Threat Intel Context|Escalation Recommendation|Risk Score|Risk Assessment|Threat Assessment|MITRE ATT&CK Techniques|Recommended Response|Investigation Steps):",
+    r"^(?:\#+\s*)?(Observed Evidence|IOCs|IOCs Extracted|AI Reasoning|RAG Threat Intel Context|Escalation Recommendation|Risk Score|Risk Assessment|Threat Assessment|MITRE ATT&CK Techniques|Alert-Associated MITRE Techniques|Alert Facts|Upstream Model Risk|Observed Telemetry|Evidence Interpretation|ARIA Risk Assessment|Recommended Response|Recommended Investigation|Investigation Steps|Evidence Sources):",
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -103,7 +104,7 @@ class ResponseValidator:
         result = ValidationResult()
 
         self._check_ungrounded_artifacts(response, alert_text, result)
-        self._check_mitre_pairs(response, context, result)
+        self._check_mitre_pairs(response, alert_text, context, result)
         self._check_threat_actors_and_malware(response, alert_text, context, result)
         self._check_fabricated_severity(response, alert_text, result)
         self._check_playbook_tracing(response, context, result)
@@ -157,16 +158,16 @@ class ResponseValidator:
     def _check_mitre_pairs(
         self,
         response: str,
+        alert_text: str,
         context: list[dict[str, Any]] | dict[str, Any],
         result: ValidationResult,
     ) -> None:
         """
-        Flag technique IDs whose ID doesn't appear anywhere in the
-        retrieved documents' text/metadata for this specific run, or whose
-        canonical name does not appear near the cited ID in the response.
+        Flag technique IDs whose ID doesn't appear in either the alert text or
+        retrieved documents' text/metadata for this specific run.
         """
 
-        context_parts = []
+        context_parts = [alert_text]
         if isinstance(context, dict):
             context_docs = context.get("documents", [])
         else:
@@ -185,18 +186,18 @@ class ResponseValidator:
             technique_id = match.group(0)
             tech_id_lower = technique_id.lower()
 
-            # Strict rule 1: any cited technique ID MUST appear in the retrieved context (case-insensitive)
             if tech_id_lower not in full_context_str:
                 result.warnings.append(
                     f"MITRE technique '{technique_id}' was cited in the response "
-                    f"but does not appear anywhere in the retrieved context for this run."
+                    f"but does not appear anywhere in the alert text or retrieved context for this run."
                 )
                 continue
 
-            # Strict rule 2: if canonical name is known, check if it appears in the response
             canonical_name = KNOWN_TECHNIQUES.get(technique_id)
             if canonical_name:
-                if canonical_name.lower() not in response.lower():
+                alt_name = re.sub(r"\band\b", "&", canonical_name, flags=re.IGNORECASE)
+                resp_lower = response.lower()
+                if canonical_name.lower() not in resp_lower and alt_name.lower() not in resp_lower:
                     result.warnings.append(
                         f"MITRE technique '{technique_id}' is known as '{canonical_name}', "
                         f"but that name was not found anywhere in the response."
